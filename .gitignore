@@ -1,0 +1,11 @@
+# Models, calibration data, captures and experiments: large or third-party
+/work/
+# Build outputs
+/spikes/zerocopy/zc_test
+/spikes/cpufe/cpufe
+*.raw
+*.rgb
+/build/
+*.o
+# Python caches
+__pycache__/

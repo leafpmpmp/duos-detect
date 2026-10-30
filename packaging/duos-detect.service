@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[Unit]
+Description=duos-detect person detection (camera and TPU)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/duos-detect
+# The camera and TPU drivers are modules: wait until their devices exist
+ExecStartPre=/bin/sh -c 'until [ -e /dev/cvi-tpu0 ] && [ -e /dev/media0 ]; do sleep 0.5; done'
+TimeoutStartSec=60
+ExecStart=/usr/bin/duos-detect -m ${DUOS_DETECT_MODEL} $DUOS_DETECT_ARGS
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

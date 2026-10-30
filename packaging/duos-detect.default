@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Options for the duos-detect service (systemctl restart duos-detect after
+# a change). See duos-detect -h for all options.
+#
+# Models in /usr/share/duos-detect/models:
+#   person-yolo11n-448x320  fast: up to 68 fps in the 4:3 sensor mode
+#   person-yolo11n-576x320  2304x1296 sensor mode, up to 56 fps
+#   person-yolo11s-448x320  more accurate, ~30 fps: add -r 30
+DUOS_DETECT_MODEL=/usr/share/duos-detect/models/person-yolo11n-448x320.cvimodel
+
+# -H 8080   web preview and API on port 8080
+# -f auto   autofocus at start (or -f 0..1023 for a fixed focus)
+# -R 50     real-time priority; inside a service it needs the kernel
+#           option rt_group_sched=0 (without it the program runs at normal
+#           priority and says so in the log)
+# -L 60     statistics in the log once a minute
+DUOS_DETECT_ARGS="-H 8080 -f auto -R 50 -L 60"
