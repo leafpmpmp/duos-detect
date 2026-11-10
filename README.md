@@ -166,6 +166,12 @@ the rest dark. The exposure time increases first, then the gain (up to
 number of periods (10 ms or 8.3 ms). Then mains lighting does not make bands
 in the image. Autofocus starts after the exposure settles.
 
+Autofocus sweeps the lens and keeps the sharpest position: a coarse pass over
+the whole range, then a fine pass. It measures the central half of the frame,
+or a window of a quarter of the frame around a point: click the viewer image,
+or ask `/api/focus?auto=1&x=X&y=Y`. A run takes about 5.4 s at 15 fps. A new
+request starts a new run.
+
 Auto white balance takes the grey world of the frame and moves it onto the
 colour temperature curve of the IMX708. The white point can stay up to 0.06
 (in R/G and B/G) off the curve, so that grey stays grey under greenish LED
@@ -194,12 +200,12 @@ Start the program with `-H port`. All requests are `GET`.
 
 | Path | Result |
 |---|---|
-| `/` | Viewer page: the live preview with boxes, the exposure, a focus slider and an autofocus button |
+| `/` | Viewer page: the live preview with boxes, the exposure, a focus slider and an autofocus button; click the preview to focus there |
 | `/stream.mjpg` | MJPEG stream with boxes, at the `-F` frame rate |
 | `/snapshot.jpg` | The next frame as one JPEG |
 | `/api/detections` | The latest result as JSON |
 | `/api/events` | Server-Sent Events: one JSON result per frame |
-| `/api/focus` | Lens state. `?value=N` moves the lens, `?auto` starts autofocus |
+| `/api/focus` | Lens state. `?value=N` moves the lens, `?auto` starts autofocus; `&x=X&y=Y` (fractions of the preview) focuses around that point |
 | `/api/exposure` | Exposure time (µs), analogue gain, mean luminance, white balance temperature (K) and gains |
 
 A result:

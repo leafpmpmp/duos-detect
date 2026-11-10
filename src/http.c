@@ -66,6 +66,9 @@ struct http_server {
 	struct frame in;
 	int frame_ready, want;
 	double last_frame;
+	int prev_w, prev_h;	/* preview (detector input) */
+	int frame_w, frame_h;	/* sensor frame; 0: autofocus at a point is off */
+	float scale_x, off_x, scale_y, off_y;	/* preview pixel to frame */
 
 	/* This thread only */
 	struct client cl[MAX_CLIENTS];
@@ -79,11 +82,12 @@ static const char page[] =
 	"<title>duos-detect</title><style>"
 	"body{margin:0;background:#111;color:#ddd;font:14px system-ui,sans-serif}"
 	"main{max-width:900px;margin:auto;padding:12px}"
-	"img{width:100%;background:#222}pre{white-space:pre-wrap}a{color:#8cf}"
-	"</style><main><img src=/stream.mjpg alt=preview><pre id=s>waiting</pre>"
+	"img{width:100%;background:#222;cursor:crosshair}pre{white-space:pre-wrap}a{color:#8cf}"
+	"</style><main><img id=v src=/stream.mjpg alt=preview title='click to focus there'>"
+	"<pre id=s>waiting</pre>"
 	"<pre id=x></pre>"
 	"<p><label>focus <input id=f type=range min=0 max=1023 style='width:55%'>"
-	" <span id=fv></span></label> <button id=a>auto</button>"
+	" <span id=fv></span></label> <button id=a>auto</button> or click the image"
 	"<p><a href=/api/detections>/api/detections</a> "
 	"<a href=/api/events>/api/events</a> <a href=/snapshot.jpg>/snapshot.jpg</a>"
 	"</main><script>"
@@ -96,6 +100,9 @@ static const char page[] =
 	"f.value=fv.textContent=j.focus;if(j.auto)setTimeout(poll,200)});"
 	"document.getElementById('a').onclick=()=>"
 	"fetch('/api/focus?auto=1').then(()=>setTimeout(poll,200));"
+	"document.getElementById('v').onclick=ev=>{const r=ev.target.getBoundingClientRect();"
+	"fetch('/api/focus?auto=1&x='+((ev.clientX-r.left)/r.width).toFixed(3)"
+	"+'&y='+((ev.clientY-r.top)/r.height).toFixed(3)).then(()=>setTimeout(poll,200))};"
 	"const s=document.getElementById('s'),e=new EventSource('/api/events');"
 	"let n=0,t=performance.now();"
 	"e.onmessage=m=>{const d=JSON.parse(m.data),now=performance.now();n++;"
@@ -205,6 +212,49 @@ static void reply(struct client *c, const char *status, const char *type,
 		drop(c);
 }
 
+/* The value of key in a query string ("a=1&b=2"), or NULL */
+static const char *param(const char *query, const char *key)
+{
+	size_t n = strlen(key);
+
+	for (const char *p = query; p; p = strchr(p, '&') ? strchr(p, '&') + 1 : NULL)
+		if (!strncmp(p, key, n) && p[n] == '=')
+			return p + n + 1;
+	return NULL;
+}
+
+/* Autofocus around a point of the preview, x and y as fractions of it */
+static void focus_at(struct http_server *s, float x, float y)
+{
+	float fx = -1, fy = -1;
+
+	pthread_mutex_lock(&s->lock);
+	if (s->frame_w) {
+		fx = (x * s->prev_w * s->scale_x + s->off_x) / s->frame_w;
+		fy = (y * s->prev_h * s->scale_y + s->off_y) / s->frame_h;
+	}
+	pthread_mutex_unlock(&s->lock);
+	if (fx < 0 && fy < 0)
+		af_start();	/* no geometry */
+	else			/* the grey side columns are off the frame: clamp */
+		af_start_at(fx < 0 ? 0 : fx > 1 ? 1 : fx, fy < 0 ? 0 : fy > 1 ? 1 : fy);
+}
+
+void http_set_geometry(struct http_server *s, int prev_w, int prev_h, int frame_w,
+		       int frame_h, float scale_x, float off_x, float scale_y, float off_y)
+{
+	pthread_mutex_lock(&s->lock);
+	s->prev_w = prev_w;
+	s->prev_h = prev_h;
+	s->frame_w = frame_w;
+	s->frame_h = frame_h;
+	s->scale_x = scale_x;
+	s->off_x = off_x;
+	s->scale_y = scale_y;
+	s->off_y = off_y;
+	pthread_mutex_unlock(&s->lock);
+}
+
 /* Parse "GET /path HTTP/1.x" and set the client up */
 static void route(struct http_server *s, struct client *c)
 {
@@ -229,12 +279,18 @@ static void route(struct http_server *s, struct client *c)
 	} else if (!strcmp(path, "/api/focus")) {
 		char body[96];
 		int v, min, max, n;
-		const char *q = query ? strstr(query, "value=") : NULL;
+		const char *q = query ? param(query, "value") : NULL;
+		const char *x = query ? param(query, "x") : NULL;
+		const char *y = query ? param(query, "y") : NULL;
 
 		if (q && !af_busy())
-			lens_set(atoi(q + 6));
-		if (query && strstr(query, "auto"))
-			af_start();
+			lens_set(atoi(q));
+		if (query && strstr(query, "auto")) {
+			if (x && y)
+				focus_at(s, strtof(x, NULL), strtof(y, NULL));
+			else
+				af_start();
+		}
 		if (lens_get(&v, &min, &max)) {
 			reply(c, "404 Not Found", "application/json", "{}\n", 3);
 		} else {

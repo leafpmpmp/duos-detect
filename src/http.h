@@ -14,7 +14,8 @@
  *   /stream.mjpg    MJPEG preview of the detector input with the boxes
  *   /snapshot.jpg   one preview frame
  *   /api/detections the latest result (JSON)
- *   /api/focus      lens position; ?value=N moves it, ?auto runs autofocus
+ *   /api/focus      lens position; ?value=N moves it, ?auto runs autofocus,
+ *                   &x=X&y=Y around that point of the preview (fractions)
  *   /api/exposure   exposure time, gain and white balance
  *   /api/events     every result as Server-Sent Events (JSON)
  * Slow clients skip frames; they never block the pipeline.
@@ -30,5 +31,11 @@ int http_want_frame(struct http_server *s);
 /* Copies a preview frame: [3][h][w] int8 planes, boxes in its pixels */
 void http_put_frame(struct http_server *s, const int8_t *rgb, int w, int h,
 		    const struct det_box *box, int n);
+/*
+ * Preview and sensor frame sizes, and the frame point of a preview pixel:
+ * frame = preview * scale + off. Needed for autofocus at a point.
+ */
+void http_set_geometry(struct http_server *s, int prev_w, int prev_h, int frame_w,
+		       int frame_h, float scale_x, float off_x, float scale_y, float off_y);
 
 #endif

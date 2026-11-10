@@ -450,6 +450,8 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 		g.http = http_start(g.http_port, g.preview_fps);
 		if (!g.http)
 			return 1;
+		http_set_geometry(g.http, fp->out_w, fp->out_h, fp->width, fp->height,
+				  g.scale_x, g.off_x, g.scale_y, g.off_y);
 		fprintf(stderr, "http://<board>:%d/\n", g.http_port);
 	}
 	if (g.rt)
