@@ -18,6 +18,7 @@ struct cam_setup {
 
 struct cam_info {
 	char sensor[64];	/* entity name */
+	char subdev[64];	/* sensor node, e.g. /dev/v4l-subdev2 */
 	char video[64];		/* capture node, e.g. /dev/video0 */
 	int width, height;
 	double fps;

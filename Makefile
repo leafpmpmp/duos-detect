@@ -24,7 +24,7 @@ CFLAGS += $(ARCHFLAGS) -std=gnu11 -Wall -Wextra -I$(CVIRT)/include
 LDLIBS = -L$(CVIRT)/lib -lcviruntime -lcvikernel -ljpeg -lpthread -lm
 
 OBJ = $(addprefix $(B)/, main.o capture.o frontend.o detector.o http.o \
-	preview.o ycc.o cpu.o lens.o af.o camera.o) $(XTV)
+	preview.o ycc.o cpu.o lens.o af.o ae.o awb.o camera.o) $(XTV)
 
 all: $(B)/duos-detect $(B)/fe-bench $(B)/jpeg-bench
 

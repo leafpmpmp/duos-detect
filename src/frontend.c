@@ -21,6 +21,10 @@
 #include "frontend.h"
 
 #define BIN 4
+#define GAMMA_N		16384	/* steps of the gamma table over 0..1 */
+#define METER_STEP	4	/* metering: every 4th block of a row */
+#define METER_ROWS	8	/* in every 8th output row */
+#define CLIP		250	/* MSB value of a clipped sample */
 
 struct frontend {
 	struct fe_params p;
@@ -31,6 +35,11 @@ struct frontend {
 	int xtv;		/* use the vector unit */
 	int16_t lut16[3][8 * 255 + 1];	/* same, for XTheadVector */
 #endif
+	int black;		/* MSB black level, for the statistics */
+	int meter_off[4];	/* byte offsets of R, G1, G2, B in a 2x2 cell */
+	int meter_n;		/* metered cells per row */
+	uint8_t meter_zone[256];	/* zone column of each cell */
+	int8_t gam[GAMMA_N + 1];	/* linear 0..1 -> int8 output */
 };
 
 const char *fe_simd(const struct frontend *fe)
@@ -79,11 +88,9 @@ void fe_set_gains(struct frontend *fe, const float gains[3])
 		for (int s = 0; s <= n[c] * 255; s++) {
 			float v = ((float)s / n[c] - p->black) * gains[c] /
 				  (p->white - p->black);
-			long q;
 
 			v = v < 0 ? 0 : v > 1 ? 1 : v;
-			q = lroundf(powf(v, 1 / p->gamma) * p->out_scale);
-			fe->lut[c][s] = q > 127 ? 127 : q;
+			fe->lut[c][s] = fe->gam[lroundf(v * GAMMA_N)];
 #ifdef __riscv
 			fe->lut16[c][s] = fe->lut[c][s];
 #endif
@@ -106,11 +113,25 @@ struct frontend *fe_create(const struct fe_params *p)
 		free(fe);
 		return NULL;
 	}
+	/* White balance changes rebuild the tables: keep powf out of that */
+	for (int i = 0; i <= GAMMA_N; i++) {
+		long q = lroundf(powf((float)i / GAMMA_N, 1 / p->gamma) * p->out_scale);
+
+		fe->gam[i] = q > 127 ? 127 : q;
+	}
 	fe_set_gains(fe, p->gains);
 	fe->pad = (int8_t)lroundf(p->pad_value * p->out_scale);
 #ifdef __riscv
 	fe->xtv = !p->no_simd && cpu_xtheadvector();
 #endif
+	fe->black = (int)lroundf(p->black);
+	for (int c = 0; c < 4; c++)
+		fe->meter_off[c] = (fe->pos[c] >> 1) * p->stride + (fe->pos[c] & 1);
+	fe->meter_n = (p->out_w - 2 * p->pad) / METER_STEP;
+	if (fe->meter_n > (int)sizeof(fe->meter_zone))
+		fe->meter_n = sizeof(fe->meter_zone);
+	for (int i = 0; i < fe->meter_n; i++)
+		fe->meter_zone[i] = i * METER_ZX / fe->meter_n;
 	return fe;
 }
 
@@ -183,7 +204,65 @@ static int row_neon(const struct frontend *fe, const uint8_t *r0, int stride,
 }
 #endif
 
-void fe_run(const struct frontend *fe, const uint8_t *raw, int8_t *out)
+/* Value above black, else 0. No branch: the C906 has no conditional move. */
+static inline uint32_t above(int v, int black)
+{
+	int d = v - black;
+
+	return d & ~(d >> 31);
+}
+
+static inline void zone_add(struct meter_zone *z, const struct meter_zone *a)
+{
+	z->r += a->r;
+	z->g += a->g;
+	z->b += a->b;
+	z->n += a->n;
+	z->ur += a->ur;
+	z->ug += a->ug;
+	z->ub += a->ub;
+	z->un += a->un;
+}
+
+/*
+ * One 2x2 cell per 16x32 pixels, from the raw rows of an output row.
+ * The sums of a zone stay in registers until the next zone starts. Kept
+ * out of fe_run: inlined, it slows the NEON row loop by 7%.
+ */
+static __attribute__((noinline)) void meter_row(const struct frontend *fe,
+						const uint8_t *r0, int y,
+						struct meter *m)
+{
+	const int black = fe->black, *off = fe->meter_off;
+	struct meter_zone *zr = m->z[y * METER_ZY / fe->p.out_h], a = { 0 };
+	int zone = fe->meter_zone[0];
+
+	for (int i = 0; i < fe->meter_n; i++) {
+		const uint8_t *q = r0 + (i * METER_STEP + METER_STEP / 2) * 6;
+		int vr = q[off[0]], vg1 = q[off[1]], vg2 = q[off[2]], vb = q[off[3]];
+		uint32_t r = above(vr, black), b = above(vb, black);
+		uint32_t g = above(vg1, black) + above(vg2, black);
+		uint32_t ok = (vr < CLIP) & (vg1 < CLIP) & (vg2 < CLIP) & (vb < CLIP);
+
+		if (fe->meter_zone[i] != zone) {
+			zone_add(&zr[zone], &a);
+			a = (struct meter_zone){ 0 };
+			zone = fe->meter_zone[i];
+		}
+		a.r += r;
+		a.g += g;
+		a.b += b;
+		a.n++;
+		a.ur += r & -ok;
+		a.ug += g & -ok;
+		a.ub += b & -ok;
+		a.un += ok;
+	}
+	zone_add(&zr[zone], &a);
+}
+
+void fe_run(const struct frontend *fe, const uint8_t *raw, int8_t *out,
+	    struct meter *m)
 {
 	const struct fe_params *p = &fe->p;
 	const int n = p->out_w - 2 * p->pad, plane = p->out_w * p->out_h;
@@ -192,11 +271,18 @@ void fe_run(const struct frontend *fe, const uint8_t *raw, int8_t *out)
 	const uint16_t *sr = s[fe->pos[0]], *sg1 = s[fe->pos[1]],
 		       *sg2 = s[fe->pos[2]], *sb = s[fe->pos[3]];
 
+	if (m) {
+		memset(m->z, 0, sizeof(m->z));
+		m->scale = p->white - p->black;
+	}
 	for (int y = 0; y < p->out_h; y++) {
 		const uint8_t *r0 = raw + (size_t)(y + p->top) * BIN * p->stride +
 				    p->left * 6;
 		int8_t *R = out + y * p->out_w, *G = R + plane, *B = G + plane;
 
+		/* Statistics from the raw rows of this output row */
+		if (m && y % METER_ROWS == METER_ROWS / 2)
+			meter_row(fe, r0, y, m);
 		for (int c = 0; c < 3 && p->pad; c++) {
 			memset(R + c * plane, fe->pad, p->pad);
 			memset(R + c * plane + p->pad + n, fe->pad, p->pad);

@@ -15,6 +15,7 @@
  *   /snapshot.jpg   one preview frame
  *   /api/detections the latest result (JSON)
  *   /api/focus      lens position; ?value=N moves it, ?auto runs autofocus
+ *   /api/exposure   exposure time, gain and white balance
  *   /api/events     every result as Server-Sent Events (JSON)
  * Slow clients skip frames; they never block the pipeline.
  */

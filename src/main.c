@@ -24,12 +24,16 @@
 #include "detector.h"
 #include "frontend.h"
 #include "http.h"
+#include "ae.h"
 #include "af.h"
+#include "awb.h"
 #include "camera.h"
 #include "lens.h"
 
 #define NSLOTS	2
 #define MAX_BOX	300
+#define METER_EVERY	3	/* frames between exposure and white balance updates */
+#define AF_WAIT		90	/* most frames autofocus waits for the exposure */
 
 enum slot_state { FREE, WRITING, READY, BUSY };
 
@@ -63,6 +67,8 @@ static struct {
 	int http_port, preview_fps, frame_w, frame_h, focus, focus_auto;
 	struct cam_setup cam;	/* sensor mode and frame rate */
 	int keep_cam;		/* use the camera setup as it is */
+	double exp_us, exp_gain;	/* fixed exposure; 0: automatic */
+	int flicker_hz, awb_auto;
 	float conf, iou, scale_x, scale_y, off_x, off_y;
 	double interval;
 	int lost_warned;
@@ -70,6 +76,7 @@ static struct {
 	.lock = PTHREAD_MUTEX_INITIALIZER,
 	.cond = PTHREAD_COND_INITIALIZER,
 	.conf = 0.4f, .iou = 0.45f, .interval = 2, .max_box = 64, .focus = -1,
+	.exp_gain = 1, .awb_auto = 1,
 };
 
 static double now_ms(void)
@@ -143,8 +150,16 @@ static void report(int final)
 		d.fe / (d.frames ? d.frames : 1), d.tpu / n, d.dec / n,
 		d.lat / n, final ? g.lat_max_all : g.lat_max, d.dropped, d.lost,
 		100 * (cpu - cb) / (t - tb), final ? "\n" : "");
-	if (!final)
-		fprintf(stderr, " | peak front end %.1f tpu %.1f ms\n", g.pk.fe, g.pk.tpu);
+	if (!final) {
+		struct ae_status ae;
+		struct awb_status wb;
+
+		if (!ae_get(&ae))
+			fprintf(stderr, " | exposure %.1f ms x%.2f", ae.exposure_us / 1e3, ae.gain);
+		awb_get(&wb);
+		fprintf(stderr, " | %.0f K | peak front end %.1f tpu %.1f ms\n", wb.ct,
+			g.pk.fe, g.pk.tpu);
+	}
 	if (!g.lost_warned && d.lost * 10 > d.frames + d.lost) {
 		g.lost_warned = 1;
 		fprintf(stderr, "camera: the capture driver lost %lu of %lu frames: "
@@ -328,8 +343,9 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 	pthread_t th;
 	uint32_t fourcc;
 	struct det_box box[MAX_BOX];
-	uint32_t seq_next = 0;
-	int bin = 4;
+	static struct meter m;
+	uint32_t seq_next = 0, seq_meter = 0, n_meter = 0;
+	int bin = 4, af_wait = g.focus_auto;
 
 	if (!g.keep_cam) {
 		g.cam.in_w = fp->out_w;
@@ -340,7 +356,13 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 			ci.width, ci.height, ci.fps, ci.flipped ? ", flipped (rotation 180)" : "");
 		if (!dev)
 			dev = ci.video;
+		/* The gain code and the tuning data are those of the IMX708 */
+		if (strncmp(ci.sensor, "imx708", 6))
+			fprintf(stderr, "exposure: no control for %s, kept as set\n", ci.sensor);
+		else if (ae_open(ci.subdev, ci.fps, g.exp_us, g.exp_gain, g.flicker_hz))
+			return 1;
 	}
+	awb_init(fp->gains, g.awb_auto);
 	cap = cap_open(dev ? dev : "/dev/video0", 4);
 	if (!cap)
 		return 1;
@@ -405,12 +427,10 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 	}
 	g.t0 = g.t_last = now_ms();
 	g.cpu0 = g.cpu_last = cpu_ms();
-	if (g.focus_auto)
-		af_start();
 	for (long f = 0; !g.stop && (!frames || f < frames); f++) {
 		struct cap_frame fr;
 		double t0;
-		int k = 0;
+		int k = 0, due;
 		int32_t lost;
 
 		if (cap_dequeue(cap, &fr)) {
@@ -421,6 +441,11 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 		/* The driver numbers every sensor frame: a gap is a lost frame */
 		lost = f ? (int32_t)(fr.sequence - seq_next) : 0;
 		seq_next = fr.sequence + 1;
+		/* Focus at the settled exposure: contrast depends on brightness */
+		if (af_wait && (ae_settled() || f >= AF_WAIT)) {
+			af_wait = 0;
+			af_start();
+		}
 		/* Contrast autofocus measures the raw frame while it runs */
 		if (af_busy())
 			af_frame(fr.data, fp->width, fp->height, fp->stride);
@@ -428,8 +453,17 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 			cap_queue(cap, fr.index);
 			break;
 		}
+		/* Exposure and white balance hold still while the lens moves */
+		due = !af_busy() && (!f || fr.sequence - seq_meter >= METER_EVERY);
 		t0 = now_ms();
-		fe_run(fe, fr.data, det_input(g.det, k));
+		fe_run(fe, fr.data, det_input(g.det, k), due ? &m : NULL);
+		if (due) {
+			seq_meter = m.seq = fr.sequence;
+			/* White balance changes slowly: every fourth time */
+			if (!(n_meter++ & 3) && awb_update(&m, fp->gains))
+				fe_set_gains(fe, fp->gains);
+			ae_update(&m, fr.ts_ns, fp->gains);
+		}
 		t0 = now_ms() - t0;
 		cap_queue(cap, fr.index);
 
@@ -461,6 +495,7 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 	http_stop(g.http);
 	g.http = NULL;
 	lens_close();
+	ae_close();
 	return 0;
 }
 
@@ -511,7 +546,12 @@ static void usage(const char *prog)
 		"  -d dev     capture device (default: found in the media graph)\n"
 		"  -s WxH     sensor mode (default: the best fit for the model input)\n"
 		"  -r fps     frame rate (default: the fastest of the mode)\n"
-		"  -K         keep the camera setup as it is (no flips, modes, rate)\n"
+		"  -e exp     exposure: \"auto\" (default), or a fixed time in us and\n"
+		"             analogue gain, e.g. 8333,2\n"
+		"  -A hz      mains frequency for flicker-free exposure: 50 or 60\n"
+		"             (default 0: off)\n"
+		"  -K         keep the camera setup as it is (no flips, modes, rate,\n"
+		"             exposure)\n"
 		"  -i file    detect on planar RGB images instead of the camera\n"
 		"             (\"-\": a stream of them on stdin)\n"
 		"  -n frames  stop after this many frames (0: until Ctrl-C)\n"
@@ -519,7 +559,7 @@ static void usage(const char *prog)
 		"  -I iou     NMS overlap threshold (0.45)\n"
 		"  -M boxes   most boxes per frame (64, at most 300)\n"
 		"  -k class   class index (0: person)\n"
-		"  -g R,G,B   white balance gains (1.942,1,1.623)\n"
+		"  -g R,G,B   fixed white balance gains (default: automatic)\n"
 		"  -B black   black level, 8-bit scale (16)\n"
 		"  -p         print boxes as JSON lines\n"
 		"  -L sec     statistics every sec seconds (2; 0: only at the end)\n"
@@ -543,7 +583,7 @@ int main(int argc, char **argv)
 	long frames = 0;
 	int sequential = 0, opt, ret;
 
-	while ((opt = getopt(argc, argv, "m:d:i:n:c:I:M:k:g:B:pSR:H:F:f:s:r:KL:")) != -1) {
+	while ((opt = getopt(argc, argv, "m:d:i:n:c:I:M:k:g:B:pSR:H:F:f:s:r:e:A:KL:")) != -1) {
 		switch (opt) {
 		case 'm': model = optarg; break;
 		case 'd': dev = optarg; break;
@@ -556,6 +596,23 @@ int main(int argc, char **argv)
 		case 'g':
 			if (sscanf(optarg, "%f,%f,%f", &fp.gains[0], &fp.gains[1],
 				   &fp.gains[2]) != 3) {
+				usage(argv[0]);
+				return 1;
+			}
+			g.awb_auto = 0;
+			break;
+		case 'e':
+			g.exp_us = 0;
+			if (strcmp(optarg, "auto") &&
+			    (sscanf(optarg, "%lf,%lf", &g.exp_us, &g.exp_gain) < 1 ||
+			     g.exp_us <= 0 || g.exp_gain < 1)) {
+				usage(argv[0]);
+				return 1;
+			}
+			break;
+		case 'A':
+			g.flicker_hz = atoi(optarg);
+			if (g.flicker_hz && g.flicker_hz != 50 && g.flicker_hz != 60) {
 				usage(argv[0]);
 				return 1;
 			}

@@ -14,4 +14,6 @@ DUOS_DETECT_MODEL=/usr/share/duos-detect/models/person-yolo11n-448x320.cvimodel
 #           option rt_group_sched=0 (without it the program runs at normal
 #           priority and says so in the log)
 # -L 60     statistics in the log once a minute
+# Exposure and white balance are automatic. Under mains lighting, add
+# -A 50 or -A 60 (the mains frequency) to stop flicker bands.
 DUOS_DETECT_ARGS="-H 8080 -f auto -R 50 -L 60"

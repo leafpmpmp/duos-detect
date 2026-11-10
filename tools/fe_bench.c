@@ -29,7 +29,7 @@ static double run(struct frontend *fe, const uint8_t *raw, int8_t *out, int iter
 
 	for (int i = 0; i < iter; i++) {
 		t = now_ms();
-		fe_run(fe, raw, out);
+		fe_run(fe, raw, out, NULL);
 		t = now_ms() - t;
 		if (t < best)
 			best = t;

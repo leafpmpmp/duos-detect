@@ -8,7 +8,7 @@ HTTP. It runs on the ARM core or on the RISC-V core.
 - Detection at 60 fps, with 35 ms from frame capture to result.
 - INT8 YOLO11 person models, fine-tuned on COCO.
 - JSON API, Server-Sent Events and an MJPEG preview with boxes.
-- Contrast autofocus.
+- Auto exposure, auto white balance and contrast autofocus.
 - Debian packages and a systemd service.
 
 ## Performance
@@ -119,7 +119,12 @@ usage: duos-detect -m model.cvimodel [options]
   -d dev     capture device (default: found in the media graph)
   -s WxH     sensor mode (default: the best fit for the model input)
   -r fps     frame rate (default: the fastest of the mode)
-  -K         keep the camera setup as it is (no flips, modes, rate)
+  -e exp     exposure: "auto" (default), or a fixed time in us and
+             analogue gain, e.g. 8333,2
+  -A hz      mains frequency for flicker-free exposure: 50 or 60
+             (default 0: off)
+  -K         keep the camera setup as it is (no flips, modes, rate,
+             exposure)
   -i file    detect on planar RGB images instead of the camera
              ("-": a stream of them on stdin)
   -n frames  stop after this many frames (0: until Ctrl-C)
@@ -127,7 +132,7 @@ usage: duos-detect -m model.cvimodel [options]
   -I iou     NMS overlap threshold (0.45)
   -M boxes   most boxes per frame (64, at most 300)
   -k class   class index (0: person)
-  -g R,G,B   white balance gains (1.942,1,1.623)
+  -g R,G,B   fixed white balance gains (default: automatic)
   -B black   black level, 8-bit scale (16)
   -p         print boxes as JSON lines
   -L sec     statistics every sec seconds (2; 0: only at the end)
@@ -149,10 +154,26 @@ the sensor mode that fits the model input best:
 | 2304x1296 | full | 56 | 576x320 model (full width); 448x320 models when the 4:3 mode is missing (centre 78%) |
 | 1728x1296 (4:3) | 75% of the width, full height | 68 | 448x320 models |
 
+Auto exposure sets the exposure time and the analogue gain of the sensor. The
+centre-weighted mean luminance goes to 20% of full scale. The brightest
+tenth of the frame does not count, so lamps and small windows do not make
+the rest dark. The exposure time increases first, then the gain (up to
+16x). From a bad start, the exposure settles in about 0.3 s. With `-A 50` or
+`-A 60`, an exposure time longer than one flicker period becomes a whole
+number of periods (10 ms or 8.3 ms). Then mains lighting does not make bands
+in the image. Autofocus starts after the exposure settles.
+
+Auto white balance takes the grey world of the frame and moves it onto the
+colour temperature curve of the IMX708. The white point can stay up to 0.06
+(in R/G and B/G) off the curve, so that grey stays grey under greenish LED
+light. The Raspberry Pi tuning allows 0.018. The curve, the colour matrices
+and the exposure profile come from the Raspberry Pi tuning of the Camera
+Module 3.
+
 Each statistics line looks like this:
 
 ```
- 56.0 fps | front end 9.59 ms | tpu 12.28 ms | decode 0.02 ms | latency 40.1 ms (max 44.6) | dropped 0 | lost 0 | cpu 59% | peak front end 10.8 tpu 12.7 ms
+ 68.5 fps | front end 6.39 ms | tpu 12.10 ms | decode 0.02 ms | latency 33.6 ms (max 34.0) | dropped 0 | lost 0 | cpu 48% | exposure 14.1 ms x16.00 | 5300 K | peak front end 6.6 tpu 12.2 ms
 ```
 
 - `dropped` counts the frames that a newer frame replaced before the TPU took
@@ -160,6 +181,8 @@ Each statistics line looks like this:
 - `lost` counts the frames that the camera driver lost before the program got
   them. When the driver loses more than 10% of the frames, the program prints
   a warning. Then set a lower frame rate with `-r`.
+- `exposure` shows the exposure time and the analogue gain. The temperature
+  after it is the white balance.
 
 ## HTTP API
 
@@ -167,12 +190,13 @@ Start the program with `-H port`. All requests are `GET`.
 
 | Path | Result |
 |---|---|
-| `/` | Viewer page: the live preview with boxes, a focus slider and an autofocus button |
+| `/` | Viewer page: the live preview with boxes, the exposure, a focus slider and an autofocus button |
 | `/stream.mjpg` | MJPEG stream with boxes, at the `-F` frame rate |
 | `/snapshot.jpg` | The next frame as one JPEG |
 | `/api/detections` | The latest result as JSON |
 | `/api/events` | Server-Sent Events: one JSON result per frame |
 | `/api/focus` | Lens state. `?value=N` moves the lens, `?auto` starts autofocus |
+| `/api/exposure` | Exposure time (µs), analogue gain, mean luminance, white balance temperature (K) and gains |
 
 A result:
 
@@ -197,7 +221,9 @@ detection. On RISC-V at 56 fps detection, the preview gets about 6 fps.
 2. The CPU front end turns each 4x4 Bayer block into one RGB pixel. One
    lookup table applies the black level, the white balance and the gamma. The
    front end writes the INT8 detector input directly into TPU memory. It uses
-   NEON on ARM and XTheadVector on RISC-V.
+   NEON on ARM and XTheadVector on RISC-V. On every third frame, it also
+   samples the raw rows in 16x12 zones for the exposure and the white
+   balance.
 3. The TPU runs the INT8 network up to the head convolutions. The CPU decodes
    the boxes and applies the score threshold and NMS.
 4. The CPU prepares frame N+1 while the TPU runs frame N.
@@ -311,9 +337,8 @@ own licences, and some permit only non-commercial use.
 
 - The models find people only. For other classes, train a model and use
   `-k`.
-- There is no auto exposure. Set the exposure and the analogue gain with
-  `v4l2-ctl` on the sensor subdevice.
-- The white balance gains are fixed (`-g`). The defaults suit indoor light.
+- The preview has no lens shading correction, so its corners are darker
+  than its centre.
 - The preview is MJPEG, encoded on the CPU. There is no H.264 or RTSP output.
 - The only supported sensor is the IMX708.
 
@@ -324,6 +349,10 @@ version 3 or later. See [LICENSE](LICENSE).
 
 The models are fine-tuned from Ultralytics YOLO11 weights (AGPL-3.0) on the
 COCO 2017 annotations (CC BY 4.0).
+
+`src/imx708_tuning.h` holds calibration data from the Raspberry Pi tuning
+file for the IMX708 in libcamera, copyright Raspberry Pi Ltd, under the
+BSD-2-Clause licence.
 
 The TPU runtime is not part of this repository. Its sources are copyright
 Cvitek and Bitmain and carry no licence grant. Build its package for your own

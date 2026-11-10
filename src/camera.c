@@ -251,6 +251,7 @@ static int setup(int mfd, const struct cam_setup *s, struct cam_info *info)
 		goto out;
 	}
 	snprintf(info->sensor, sizeof(info->sensor), "%s", sensor->name);
+	snprintf(info->subdev, sizeof(info->subdev), "%s", path);
 	sfd = open(path, O_RDWR | O_CLOEXEC);
 	if (sfd < 0) {
 		perror(path);

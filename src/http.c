@@ -20,7 +20,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ae.h"
 #include "af.h"
+#include "awb.h"
 #include "http.h"
 #include "lens.h"
 #include "preview.h"
@@ -79,6 +81,7 @@ static const char page[] =
 	"main{max-width:900px;margin:auto;padding:12px}"
 	"img{width:100%;background:#222}pre{white-space:pre-wrap}a{color:#8cf}"
 	"</style><main><img src=/stream.mjpg alt=preview><pre id=s>waiting</pre>"
+	"<pre id=x></pre>"
 	"<p><label>focus <input id=f type=range min=0 max=1023 style='width:55%'>"
 	" <span id=fv></span></label> <button id=a>auto</button>"
 	"<p><a href=/api/detections>/api/detections</a> "
@@ -98,6 +101,10 @@ static const char page[] =
 	"e.onmessage=m=>{const d=JSON.parse(m.data),now=performance.now();n++;"
 	"if(now-t>=1000){s.textContent=(n*1000/(now-t)).toFixed(1)+' results/s, '"
 	"+d.boxes.length+' people, latency '+d.latency_ms+' ms';n=0;t=now}};"
+	"const x=document.getElementById('x');"
+	"setInterval(()=>fetch('/api/exposure').then(r=>r.json()).then(j=>{"
+	"x.textContent=(j.exposure_us?'exposure '+(j.exposure_us/1000).toFixed(1)"
+	"+' ms x'+j.gain.toFixed(2)+', ':'')+'white balance '+Math.round(j.ct)+' K'}),1000);"
 	"</script>";
 
 static double now_ms(void)
@@ -236,6 +243,25 @@ static void route(struct http_server *s, struct client *c)
 				     v, min, max, af_busy() ? "true" : "false");
 			reply(c, "200 OK", "application/json", body, n);
 		}
+	} else if (!strcmp(path, "/api/exposure")) {
+		char body[256];
+		struct ae_status ae;
+		struct awb_status wb;
+		int n = 0;
+
+		awb_get(&wb);
+		if (!ae_get(&ae))
+			n = snprintf(body, sizeof(body),
+				     "{\"exposure_us\":%.0f,\"gain\":%.3f,\"luminance\":%.4f,"
+				     "\"auto_exposure\":%s,", ae.exposure_us, ae.gain, ae.luma,
+				     ae.automatic ? "true" : "false");
+		else
+			body[n++] = '{';
+		n += snprintf(body + n, sizeof(body) - n,
+			      "\"ct\":%.0f,\"gains\":[%.3f,%.3f,%.3f],\"auto_white_balance\":%s}\n",
+			      wb.ct, wb.gains[0], wb.gains[1], wb.gains[2],
+			      wb.automatic ? "true" : "false");
+		reply(c, "200 OK", "application/json", body, n);
 	} else if (!strcmp(path, "/api/events")) {
 		c->kind = EVENTS;
 		if (appendf(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
