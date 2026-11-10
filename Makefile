@@ -34,8 +34,8 @@ $(B)/duos-detect: $(OBJ)
 $(B)/fe-bench: $(B)/fe_bench.o $(B)/frontend.o $(B)/cpu.o $(XTV)
 	$(CC) $(LDFLAGS) -o $@ $^ -lm
 
-$(B)/jpeg-bench: $(B)/jpeg_bench.o $(B)/preview.o $(B)/ycc.o $(B)/cpu.o $(XTV)
-	$(CC) $(LDFLAGS) -o $@ $^ -ljpeg
+$(B)/jpeg-bench: $(B)/jpeg_bench.o $(B)/preview.o $(B)/ycc.o $(B)/awb.o $(B)/cpu.o $(XTV)
+	$(CC) $(LDFLAGS) -o $@ $^ -ljpeg -lpthread -lm
 
 $(B)/jpeg_bench.o: tools/jpeg_bench.c src/*.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<

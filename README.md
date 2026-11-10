@@ -166,9 +166,10 @@ in the image. Autofocus starts after the exposure settles.
 Auto white balance takes the grey world of the frame and moves it onto the
 colour temperature curve of the IMX708. The white point can stay up to 0.06
 (in R/G and B/G) off the curve, so that grey stays grey under greenish LED
-light. The Raspberry Pi tuning allows 0.018. The curve, the colour matrices
-and the exposure profile come from the Raspberry Pi tuning of the Camera
-Module 3.
+light. The Raspberry Pi tuning allows 0.018. The preview applies the colour
+matrix for the white balance temperature. The detector input does not,
+because detection does not gain from it. The curve, the colour matrices and
+the exposure profile come from the Raspberry Pi tuning of the Camera Module 3.
 
 Each statistics line looks like this:
 

@@ -17,11 +17,14 @@ enum preview_mode {
 /*
  * JPEG of the detector input with the boxes drawn in. rgb: [3][h][w] int8
  * planes R G B as the front end writes them (0..127, gamma encoded); the
- * boxes are drawn into it. w and h multiples of 16. Returns a malloc'ed
- * JPEG (free() it) and its size, or NULL.
+ * boxes are drawn into it. w and h multiples of 16. ccm: colour matrix
+ * (camera RGB to sRGB, row by row) or NULL; a matrix too large for the
+ * fixed-point steps is left out. Returns a malloc'ed JPEG (free() it) and
+ * its size, or NULL.
  */
 unsigned char *preview_jpeg(int8_t *rgb, int w, int h,
 			    const struct det_box *box, int n, int quality,
-			    enum preview_mode mode, unsigned long *size);
+			    enum preview_mode mode, const float *ccm,
+			    unsigned long *size);
 
 #endif

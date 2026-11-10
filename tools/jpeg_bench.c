@@ -2,15 +2,17 @@
 /*
  * Preview encoder check: planar RGB uint8 [3][h][w] in, JPEG with test boxes
  * out (written to OUT.jpg). Times every encoder route this CPU has and
- * checks that the vector YCbCr conversion matches the scalar one.
+ * checks that the vector YCbCr conversion matches the scalar one. ct: the
+ * colour matrix of this white point, K (default 5000; 0: none).
  *
- *   jpeg-bench in.rgb W H out.jpg [iterations]
+ *   jpeg-bench in.rgb W H out.jpg [iterations [ct]]
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+#include "awb.h"
 #include "cpu.h"
 #include "preview.h"
 #include "ycc.h"
@@ -31,6 +33,8 @@ int main(int argc, char **argv)
 		{ 300, 60, 380, 300, 0.8f, 0 },
 	};
 	int w, h, iter = argc > 5 ? atoi(argv[5]) : 20;
+	double ct = argc > 6 ? atof(argv[6]) : 5000;
+	float ccm[9], *mat = ct > 0 ? ccm : NULL;
 	unsigned char *jpg = NULL;
 	unsigned long n = 0;
 	size_t size;
@@ -39,7 +43,7 @@ int main(int argc, char **argv)
 	FILE *f;
 
 	if (argc < 5) {
-		fprintf(stderr, "usage: %s in.rgb W H out.jpg [iterations]\n", argv[0]);
+		fprintf(stderr, "usage: %s in.rgb W H out.jpg [iterations [ct]]\n", argv[0]);
 		return 1;
 	}
 	w = atoi(argv[2]);
@@ -56,14 +60,17 @@ int main(int argc, char **argv)
 	fclose(f);
 	for (size_t i = 0; i < size; i++)	/* as the front end writes it */
 		in[i] = (int8_t)((u8[i] * 127 + 127) / 255);
+	awb_ccm(ct, ccm);
 
 #ifdef __riscv
 	if (cpu_xtheadvector()) {
 		size_t p = (size_t)w * h, m = p + p / 2;
 		uint8_t *a = malloc(m), *b = malloc(m);
+		struct ycc_coef k;
 
-		ycc420(in, in + p, in + 2 * p, w, h, a, a + p, a + p + p / 4);
-		ycc420_xtv(in, in + p, in + 2 * p, w, h, b, b + p, b + p + p / 4);
+		ycc_coef(&k, mat);
+		ycc420(in, in + p, in + 2 * p, w, h, &k, a, a + p, a + p + p / 4);
+		ycc420_xtv(in, in + p, in + 2 * p, w, h, &k, b, b + p, b + p + p / 4);
 		printf("YCbCr XTheadVector vs scalar: %s\n",
 		       memcmp(a, b, m) ? "MISMATCH" : "identical");
 		free(a);
@@ -81,7 +88,7 @@ int main(int argc, char **argv)
 			memcpy(work, in, size);	/* boxes are drawn into it */
 			free(jpg);
 			t = now_ms();
-			jpg = preview_jpeg(work, w, h, box, 2, 75, mode, &n);
+			jpg = preview_jpeg(work, w, h, box, 2, 75, mode, mat, &n);
 			t = now_ms() - t;
 			if (t < best)
 				best = t;

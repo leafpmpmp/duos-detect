@@ -330,8 +330,10 @@ static void new_result(struct http_server *s)
 static void new_frame(struct http_server *s)
 {
 	struct frame t;
+	struct awb_status wb;
 	unsigned char *jpg;
 	unsigned long n;
+	float ccm[9];
 	int ready;
 
 	pthread_mutex_lock(&s->lock);
@@ -346,8 +348,11 @@ static void new_frame(struct http_server *s)
 	pthread_mutex_unlock(&s->lock);
 	if (!ready)
 		return;
+	/* The colour matrix only for the eye: the detector does not gain from it */
+	awb_get(&wb);
+	awb_ccm(wb.ct, ccm);
 	jpg = preview_jpeg(s->work.rgb, s->work.w, s->work.h, s->work.box,
-			   s->work.n, QUALITY, PREVIEW_AUTO, &n);
+			   s->work.n, QUALITY, PREVIEW_AUTO, ccm, &n);
 	if (!jpg)
 		return;
 	for (int i = 0; i < MAX_CLIENTS; i++) {
