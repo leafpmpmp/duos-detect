@@ -9,6 +9,7 @@
  */
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <pthread.h>
 #include <sched.h>
@@ -18,6 +19,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <time.h>
+#include <unistd.h>
 #include <linux/videodev2.h>
 
 #include "capture.h"
@@ -72,11 +74,14 @@ static struct {
 	float conf, iou, scale_x, scale_y, off_x, off_y;
 	double interval;
 	int lost_warned;
+	int nbuf;		/* camera buffers */
+	const char *tap;	/* SIGUSR1 saves the next raw frame here */
+	volatile sig_atomic_t tap_want;
 } g = {
 	.lock = PTHREAD_MUTEX_INITIALIZER,
 	.cond = PTHREAD_COND_INITIALIZER,
 	.conf = 0.4f, .iou = 0.45f, .interval = 2, .max_box = 64, .focus = -1,
-	.exp_gain = 1, .awb_auto = 1,
+	.exp_gain = 1, .awb_auto = 1, .nbuf = 4,
 };
 
 static double now_ms(void)
@@ -100,6 +105,38 @@ static void on_signal(int sig)
 {
 	(void)sig;
 	g.stop = 1;
+}
+
+static void on_tap(int sig)
+{
+	(void)sig;
+	g.tap_want = 1;
+}
+
+/*
+ * Write a raw frame to PATH.tmp, then rename it to PATH: a reader that waits
+ * for PATH never sees part of a frame.
+ */
+static void tap_save(const char *path, const uint8_t *data, size_t len)
+{
+	char tmp[4096];
+	int fd, ok = 0;
+
+	if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
+		return;
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0) {
+		ssize_t n;
+
+		while (len && (n = write(fd, data, len)) > 0) {
+			data += n;
+			len -= n;
+		}
+		ok = !len;
+		ok &= !close(fd);
+	}
+	if (!ok || rename(tmp, path))
+		perror("tap");
 }
 
 /*
@@ -363,7 +400,7 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 			return 1;
 	}
 	awb_init(fp->gains, g.awb_auto);
-	cap = cap_open(dev ? dev : "/dev/video0", 4);
+	cap = cap_open(dev ? dev : "/dev/video0", g.nbuf);
 	if (!cap)
 		return 1;
 	cap_format(cap, &fp->width, &fp->height, &fp->stride, &fourcc);
@@ -425,6 +462,13 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 		perror("stream on");
 		g.stop = 1;
 	}
+	if (g.tap) {
+		sigset_t usr1;
+
+		sigemptyset(&usr1);
+		sigaddset(&usr1, SIGUSR1);
+		pthread_sigmask(SIG_UNBLOCK, &usr1, NULL);
+	}
 	g.t0 = g.t_last = now_ms();
 	g.cpu0 = g.cpu_last = cpu_ms();
 	for (long f = 0; !g.stop && (!frames || f < frames); f++) {
@@ -465,6 +509,10 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 			ae_update(&m, fr.ts_ns, fp->gains);
 		}
 		t0 = now_ms() - t0;
+		if (g.tap && g.tap_want) {
+			g.tap_want = 0;
+			tap_save(g.tap, fr.data, (size_t)fp->stride * fp->height);
+		}
 		cap_queue(cap, fr.index);
 
 		pthread_mutex_lock(&g.lock);
@@ -569,7 +617,10 @@ static void usage(const char *prog)
 		"  -H port    serve a preview and the results over HTTP\n"
 		"  -F fps     preview frame rate (15)\n"
 		"  -R prio    real-time: TPU thread SCHED_FIFO at prio, capture at\n"
-		"             prio-1, the TPU driver's worker at prio+1\n",
+		"             prio-1, the TPU driver's worker at prio+1\n"
+		"  -b n       camera buffers (4, 2..8): fewer leave more CMA free\n"
+		"  -T file    on SIGUSR1, save the next raw frame to file (packed\n"
+		"             RAW12 as captured; written to file.tmp, then renamed)\n",
 		prog);
 }
 
@@ -583,7 +634,7 @@ int main(int argc, char **argv)
 	long frames = 0;
 	int sequential = 0, opt, ret;
 
-	while ((opt = getopt(argc, argv, "m:d:i:n:c:I:M:k:g:B:pSR:H:F:f:s:r:e:A:KL:")) != -1) {
+	while ((opt = getopt(argc, argv, "m:d:i:n:c:I:M:k:g:B:pSR:H:F:f:s:r:e:A:KL:b:T:")) != -1) {
 		switch (opt) {
 		case 'm': model = optarg; break;
 		case 'd': dev = optarg; break;
@@ -638,14 +689,23 @@ int main(int argc, char **argv)
 			else
 				g.focus = atoi(optarg);
 			break;
+		case 'b': g.nbuf = atoi(optarg); break;
+		case 'T': g.tap = optarg; break;
 		default: usage(argv[0]); return 1;
 		}
 	}
-	if (!model || g.max_box < 1 || g.max_box > MAX_BOX) {
+	if (!model || g.max_box < 1 || g.max_box > MAX_BOX || g.nbuf < 2 || g.nbuf > 8) {
 		usage(argv[0]);
 		return 1;
 	}
 	signal(SIGINT, on_signal);
+	signal(SIGUSR1, g.tap ? on_tap : SIG_IGN);
+	/* Only the capture loop takes SIGUSR1: threads started from here block it */
+	sigset_t usr1;
+
+	sigemptyset(&usr1);
+	sigaddset(&usr1, SIGUSR1);
+	pthread_sigmask(SIG_BLOCK, &usr1, NULL);
 	signal(SIGTERM, on_signal);
 
 	g.det = det_open(model, NSLOTS);

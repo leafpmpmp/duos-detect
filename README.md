@@ -143,6 +143,9 @@ usage: duos-detect -m model.cvimodel [options]
   -F fps     preview frame rate (15)
   -R prio    real-time: TPU thread SCHED_FIFO at prio, capture at
              prio-1, the TPU driver's worker at prio+1
+  -b n       camera buffers (4, 2..8): fewer leave more CMA free
+  -T file    on SIGUSR1, save the next raw frame to file (packed
+             RAW12 as captured; written to file.tmp, then renamed)
 ```
 
 The program sets up the camera itself. It finds the sensor in the media
