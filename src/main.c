@@ -17,7 +17,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include <linux/videodev2.h>
@@ -77,6 +79,8 @@ static struct {
 	int nbuf;		/* camera buffers */
 	const char *tap;	/* SIGUSR1 saves the next raw frame here */
 	volatile sig_atomic_t tap_want;
+	const char *replay;	/* -P: frames from these files replace the camera's */
+	volatile sig_atomic_t replay_next;	/* SIGUSR2s: the slide shown */
 } g = {
 	.lock = PTHREAD_MUTEX_INITIALIZER,
 	.cond = PTHREAD_COND_INITIALIZER,
@@ -111,6 +115,77 @@ static void on_tap(int sig)
 {
 	(void)sig;
 	g.tap_want = 1;
+}
+
+static void on_next(int sig)
+{
+	(void)sig;
+	g.replay_next++;
+}
+
+/*
+ * Replay: raw frames from files, shown in place of the camera's, one after
+ * another on SIGUSR2. The camera keeps running, so the load stays as live.
+ */
+static struct {
+	char **path;
+	int n, cur;
+	const uint8_t *data;
+	size_t len;
+} rp = { .cur = -1 };
+
+/* The list: one file per line, relative to the list's directory */
+static int replay_open(const char *list)
+{
+	const char *slash = strrchr(list, '/');
+	int dir = slash ? (int)(slash - list + 1) : 0;
+	char line[4096];
+	FILE *f = fopen(list, "r");
+
+	if (!f) {
+		perror(list);
+		return -1;
+	}
+	while (fgets(line, sizeof(line), f)) {
+		char **p = realloc(rp.path, (rp.n + 1) * sizeof(*p));
+
+		line[strcspn(line, "\r\n")] = 0;
+		if (!line[0])
+			continue;
+		if (!p)
+			break;
+		rp.path = p;
+		if (asprintf(&rp.path[rp.n], "%.*s%s", line[0] == '/' ? 0 : dir, list, line) < 0)
+			break;
+		rp.n++;
+	}
+	fclose(f);
+	if (!rp.n)
+		fprintf(stderr, "%s: no frames\n", list);
+	return rp.n ? 0 : -1;
+}
+
+/* Map frame k, whole in memory before it is shown */
+static int replay_show(int k, size_t len)
+{
+	struct stat st;
+	void *p = MAP_FAILED;
+	int fd = open(rp.path[k], O_RDONLY);
+
+	if (fd >= 0 && !fstat(fd, &st) && st.st_size >= (off_t)len)
+		p = mmap(NULL, len, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+	if (fd >= 0)
+		close(fd);
+	if (p == MAP_FAILED) {
+		fprintf(stderr, "%s: cannot map %zu bytes\n", rp.path[k], len);
+		return -1;
+	}
+	if (rp.data)
+		munmap((void *)rp.data, rp.len);
+	rp.data = p;
+	rp.len = len;
+	rp.cur = k;
+	return 0;
 }
 
 /*
@@ -412,6 +487,13 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 	fp->bayer = fourcc == V4L2_PIX_FMT_SBGGR12P ? "BGGR" :
 		    fourcc == V4L2_PIX_FMT_SGBRG12P ? "GBRG" :
 		    fourcc == V4L2_PIX_FMT_SGRBG12P ? "GRBG" : "RGGB";
+	if (g.replay) {
+		/* Replay frames are BGGR, as the flipped IMX708 gives them */
+		fp->bayer = "BGGR";
+		if (replay_show(0, (size_t)fp->stride * fp->height))
+			return 1;
+		fprintf(stderr, "replay: %d frames from %s\n", rp.n, g.replay);
+	}
 	/*
 	 * Centre the detector input in the 4x4-binned frame. A frame narrower
 	 * than the input gets grey columns on both sides, like the letterbox
@@ -464,17 +546,19 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 		perror("stream on");
 		g.stop = 1;
 	}
-	if (g.tap) {
-		sigset_t usr1;
+	if (g.tap || g.replay) {
+		sigset_t usr;
 
-		sigemptyset(&usr1);
-		sigaddset(&usr1, SIGUSR1);
-		pthread_sigmask(SIG_UNBLOCK, &usr1, NULL);
+		sigemptyset(&usr);
+		sigaddset(&usr, SIGUSR1);
+		sigaddset(&usr, SIGUSR2);
+		pthread_sigmask(SIG_UNBLOCK, &usr, NULL);
 	}
 	g.t0 = g.t_last = now_ms();
 	g.cpu0 = g.cpu_last = cpu_ms();
 	for (long f = 0; !g.stop && (!frames || f < frames); f++) {
 		struct cap_frame fr;
+		const uint8_t *data;
 		double t0;
 		int k = 0, due;
 		int32_t lost;
@@ -487,6 +571,14 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 		/* The driver numbers every sensor frame: a gap is a lost frame */
 		lost = f ? (int32_t)(fr.sequence - seq_next) : 0;
 		seq_next = fr.sequence + 1;
+		data = fr.data;
+		if (g.replay) {
+			int want = g.replay_next % rp.n;
+
+			if (want != rp.cur)
+				replay_show(want, (size_t)fp->stride * fp->height);
+			data = rp.data;
+		}
 		/* Focus at the settled exposure: contrast depends on brightness */
 		if (af_wait && (ae_settled() || f >= AF_WAIT)) {
 			af_wait = 0;
@@ -494,7 +586,7 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 		}
 		/* Contrast autofocus measures the raw frame while it runs */
 		if (af_busy())
-			af_frame(fr.data, fp->width, fp->height, fp->stride);
+			af_frame(data, fp->width, fp->height, fp->stride);
 		if (!sequential && (k = take_slot()) < 0) {
 			cap_queue(cap, fr.index);
 			break;
@@ -502,7 +594,7 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 		/* Exposure and white balance hold still while the lens moves */
 		due = !af_busy() && (!f || fr.sequence - seq_meter >= METER_EVERY);
 		t0 = now_ms();
-		fe_run(fe, fr.data, det_input(g.det, k), due ? &m : NULL);
+		fe_run(fe, data, det_input(g.det, k), due ? &m : NULL);
 		if (due) {
 			seq_meter = m.seq = fr.sequence;
 			/* White balance changes slowly: every fourth time */
@@ -513,7 +605,11 @@ static int run_camera(const char *dev, struct fe_params *fp, long frames,
 		t0 = now_ms() - t0;
 		if (g.tap && g.tap_want) {
 			g.tap_want = 0;
-			tap_save(g.tap, fr.data, (size_t)fp->stride * fp->height);
+			tap_save(g.tap, data, (size_t)fp->stride * fp->height);
+			if (g.replay && g.print) {
+				printf("{\"tap\":%u,\"slide\":%d}\n", fr.sequence, rp.cur);
+				fflush(stdout);
+			}
 		}
 		cap_queue(cap, fr.index);
 
@@ -622,7 +718,10 @@ static void usage(const char *prog)
 		"             prio-1, the TPU driver's worker at prio+1\n"
 		"  -b n       camera buffers (4, 2..8): fewer leave more CMA free\n"
 		"  -T file    on SIGUSR1, save the next raw frame to file (packed\n"
-		"             RAW12 as captured; written to file.tmp, then renamed)\n",
+		"             RAW12 as captured; written to file.tmp, then renamed)\n"
+		"  -P list    replay: show the raw frames listed in this file (one\n"
+		"             per line, packed RAW12 BGGR at the camera's size) in\n"
+		"             place of the camera's; SIGUSR2 shows the next one\n",
 		prog);
 }
 
@@ -636,7 +735,7 @@ int main(int argc, char **argv)
 	long frames = 0;
 	int sequential = 0, opt, ret;
 
-	while ((opt = getopt(argc, argv, "m:d:i:n:c:I:M:k:g:B:pSR:H:F:f:s:r:e:A:KL:b:T:")) != -1) {
+	while ((opt = getopt(argc, argv, "m:d:i:n:c:I:M:k:g:B:pSR:H:F:f:s:r:e:A:KL:b:T:P:")) != -1) {
 		switch (opt) {
 		case 'm': model = optarg; break;
 		case 'd': dev = optarg; break;
@@ -693,6 +792,7 @@ int main(int argc, char **argv)
 			break;
 		case 'b': g.nbuf = atoi(optarg); break;
 		case 'T': g.tap = optarg; break;
+		case 'P': g.replay = optarg; break;
 		default: usage(argv[0]); return 1;
 		}
 	}
@@ -701,13 +801,17 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	signal(SIGINT, on_signal);
+	if (g.replay && replay_open(g.replay))
+		return 1;
 	signal(SIGUSR1, g.tap ? on_tap : SIG_IGN);
-	/* Only the capture loop takes SIGUSR1: threads started from here block it */
-	sigset_t usr1;
+	signal(SIGUSR2, g.replay ? on_next : SIG_IGN);
+	/* Only the capture loop takes SIGUSR1 and SIGUSR2: threads started from here block them */
+	sigset_t usr;
 
-	sigemptyset(&usr1);
-	sigaddset(&usr1, SIGUSR1);
-	pthread_sigmask(SIG_BLOCK, &usr1, NULL);
+	sigemptyset(&usr);
+	sigaddset(&usr, SIGUSR1);
+	sigaddset(&usr, SIGUSR2);
+	pthread_sigmask(SIG_BLOCK, &usr, NULL);
 	signal(SIGTERM, on_signal);
 
 	g.det = det_open(model, NSLOTS);

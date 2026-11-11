@@ -146,6 +146,9 @@ usage: duos-detect -m model.cvimodel [options]
   -b n       camera buffers (4, 2..8): fewer leave more CMA free
   -T file    on SIGUSR1, save the next raw frame to file (packed
              RAW12 as captured; written to file.tmp, then renamed)
+  -P list    replay: show the raw frames listed in this file (one
+             per line, packed RAW12 BGGR at the camera's size) in
+             place of the camera's; SIGUSR2 shows the next one
 ```
 
 The program sets up the camera itself. It finds the sensor in the media
